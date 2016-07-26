@@ -2,7 +2,7 @@
 This source file is part of KBEngine
 For the latest info, see http://www.kbengine.org/
 
-Copyright (c) 2008-2012 KBEngine.
+Copyright (c) 2008-2016 KBEngine.
 
 KBEngine is free software: you can redistribute it and/or modify
 it under the terms of the GNU Lesser General Public License as published by
@@ -18,28 +18,33 @@ You should have received a copy of the GNU Lesser General Public License
 along with KBEngine.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "cellapp.hpp"
-#include "entity.hpp"
-#include "moveto_point_handler.hpp"	
-#include "move_controller.hpp"	
+#include "cellapp.h"
+#include "entity.h"
+#include "moveto_point_handler.h"	
+#include "move_controller.h"	
 
 namespace KBEngine{	
 
 
 //-------------------------------------------------------------------------------------
-MoveToPointHandler::MoveToPointHandler(Controller* pController, int layer, const Position3D& destPos, 
-											 float velocity, float range, bool faceMovement, 
+MoveToPointHandler::MoveToPointHandler(KBEShared_ptr<Controller> pController, int layer, const Position3D& destPos, 
+											 float velocity, float distance, bool faceMovement, 
 											bool moveVertically, PyObject* userarg):
 destPos_(destPos),
 velocity_(velocity),
 faceMovement_(faceMovement),
 moveVertically_(moveVertically),
 pyuserarg_(userarg),
-range_(range),
+distance_(distance),
 pController_(pController),
 layer_(layer)
 {
-	static_cast<MoveController*>(pController)->pMoveToPointHandler(this);
+	updatableName = "MoveToPointHandler";
+
+	Py_INCREF(userarg);
+
+	//std::static_pointer_cast<MoveController>(pController)->pMoveToPointHandler(this);
+	static_cast<MoveController*>(pController.get())->pMoveToPointHandler(this);
 	Cellapp::getSingleton().addUpdatable(this);
 }
 
@@ -50,10 +55,11 @@ velocity_(0.f),
 faceMovement_(false),
 moveVertically_(false),
 pyuserarg_(NULL),
-range_(0.f),
-pController_(NULL),
+distance_(0.f),
 layer_(0)
 {
+	updatableName = "MoveToPointHandler";
+
 	Cellapp::getSingleton().addUpdatable(this);
 }
 
@@ -71,10 +77,10 @@ MoveToPointHandler::~MoveToPointHandler()
 //-------------------------------------------------------------------------------------
 void MoveToPointHandler::addToStream(KBEngine::MemoryStream& s)
 {
-	uint8 utype = type();
+	// uint8 utype = type();
 
-	s << utype << destPos_.x << destPos_.y << destPos_.z << velocity_ << faceMovement_ << moveVertically_ <<
-		range_ << layer_;
+	s << /*utype <<*/ destPos_.x << destPos_.y << destPos_.z << velocity_ << faceMovement_ << moveVertically_ <<
+		distance_ << layer_;
 
 	s.appendBlob(script::Pickler::pickle(pyuserarg_));
 }
@@ -83,7 +89,7 @@ void MoveToPointHandler::addToStream(KBEngine::MemoryStream& s)
 void MoveToPointHandler::createFromStream(KBEngine::MemoryStream& s)
 {
 	s >> /*utype <<*/ destPos_.x >> destPos_.y >> destPos_.z >> velocity_ >> faceMovement_ >> moveVertically_ >>
-		range_ >> layer_;
+		distance_ >> layer_;
 
 	std::string val = "";
 	s.readBlob(val);
@@ -98,7 +104,10 @@ bool MoveToPointHandler::requestMoveOver(const Position3D& oldPos)
 	{
 		if(pController_->pEntity())
 			pController_->pEntity()->onMoveOver(pController_->id(), layer_, oldPos, pyuserarg_);
-		pController_->destroy();
+
+		// 如果在onMoveOver中调用cancelController（id）会导致MoveController析构导致pController_为NULL
+		if(pController_)
+			pController_->destroy();
 	}
 
 	return true;
@@ -114,6 +123,8 @@ bool MoveToPointHandler::update()
 	}
 	
 	Entity* pEntity = pController_->pEntity();
+	Py_INCREF(pEntity);
+
 	const Position3D& dstPos = destPos();
 	Position3D currpos = pEntity->position();
 	Position3D currpos_backup = currpos;
@@ -123,18 +134,26 @@ bool MoveToPointHandler::update()
 	if (!moveVertically_) movement.y = 0.f;
 	
 	bool ret = true;
+	float dist_len = KBEVec3Length(&movement);
 
-	if(KBEVec3Length(&movement) < velocity_ + range_)
+	if (dist_len < velocity_ + distance_)
 	{
 		float y = currpos.y;
-		currpos = dstPos;
 
-		if(range_ > 0.0f)
+		if (distance_ > 0.0f)
 		{
 			// 单位化向量
 			KBEVec3Normalize(&movement, &movement); 
-			movement *= range_;
-			currpos -= movement;
+				
+			if(dist_len > distance_)
+			{
+				movement *= distance_;
+				currpos = dstPos - movement;
+			}
+		}
+		else
+		{
+			currpos = dstPos;
 		}
 
 		if (!moveVertically_)
@@ -153,8 +172,14 @@ bool MoveToPointHandler::update()
 	}
 	
 	// 是否需要改变面向
-	if (faceMovement_ && (movement.x != 0.f || movement.z != 0.f))
-		direction.yaw(movement.yaw());
+	if (faceMovement_)
+	{
+		if (movement.x != 0.f || movement.z != 0.f)
+			direction.yaw(movement.yaw());
+
+		//if (movement.y != 0.f)
+		//	direction.pitch(movement.pitch());
+	}
 	
 	// 设置entity的新位置和面向
 	if(pController_)
@@ -169,11 +194,14 @@ bool MoveToPointHandler::update()
 		pEntity->onMove(pController_->id(), layer_, currpos_backup, pyuserarg_);
 
 	// 如果达到目的地则返回true
-	if(!ret)
+	if (!ret && requestMoveOver(currpos_backup))
 	{
-		return !requestMoveOver(currpos_backup);
+		Py_DECREF(pEntity);
+		delete this;
+		return false;
 	}
 
+	Py_DECREF(pEntity);
 	return true;
 }
 

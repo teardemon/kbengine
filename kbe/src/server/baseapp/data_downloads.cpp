@@ -2,7 +2,7 @@
 This source file is part of KBEngine
 For the latest info, see http://www.kbengine.org/
 
-Copyright (c) 2008-2012 KBEngine.
+Copyright (c) 2008-2016 KBEngine.
 
 KBEngine is free software: you can redistribute it and/or modify
 it under the terms of the GNU Lesser General Public License as published by
@@ -18,9 +18,9 @@ You should have received a copy of the GNU Lesser General Public License
 along with KBEngine.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "baseapp.hpp"
-#include "data_download.hpp"
-#include "data_downloads.hpp"
+#include "baseapp.h"
+#include "data_download.h"
+#include "data_downloads.h"
 
 namespace KBEngine{	
 
@@ -59,7 +59,7 @@ int16 DataDownloads::freeID(int16 id)
 	if(id > 0 && usedIDs_.find(id) != usedIDs_.end())
 		return id;
 
-	for(int16 i=2; i< 32767; i++)
+	for(int16 i=2; i< 32767; ++i)
 	{
 		if(usedIDs_.find(id + i) == usedIDs_.end())
 			return id + i;

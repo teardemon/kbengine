@@ -2,7 +2,7 @@
 This source file is part of KBEngine
 For the latest info, see http://www.kbengine.org/
 
-Copyright (c) 2008-2012 KBEngine.
+Copyright (c) 2008-2016 KBEngine.
 
 KBEngine is free software: you can redistribute it and/or modify
 it under the terms of the GNU Lesser General Public License as published by
@@ -19,9 +19,9 @@ along with KBEngine.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 
-#include "signal_handler.hpp"
-#include "helper/debug_helper.hpp"
-#include "server/serverapp.hpp"
+#include "signal_handler.h"
+#include "helper/debug_helper.h"
+#include "server/serverapp.h"
 
 namespace KBEngine{
 KBE_SINGLETON_INIT(SignalHandlers);
@@ -90,7 +90,7 @@ SignalHandlers::~SignalHandlers()
 void SignalHandlers::attachApp(ServerApp* app)
 { 
 	papp_ = app; 
-	app->mainDispatcher().addFrequentTask(this);
+	app->dispatcher().addTask(this);
 }
 
 //-------------------------------------------------------------------------------------	
@@ -149,7 +149,7 @@ bool SignalHandlers::process()
 	if(signalledVec_.size() > 0)
 	{
 		std::vector<int>::iterator iter = signalledVec_.begin();
-		for(; iter != signalledVec_.end(); iter++)
+		for(; iter != signalledVec_.end(); ++iter)
 		{
 			int sigNum = (*iter);
 			SignalHandlerMap::iterator iter1 = singnalHandlerMap_.find(sigNum);

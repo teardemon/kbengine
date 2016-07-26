@@ -2,7 +2,7 @@
 This source file is part of KBEngine
 For the latest info, see http://www.kbengine.org/
 
-Copyright (c) 2008-2012 KBEngine.
+Copyright (c) 2008-2016 KBEngine.
 
 KBEngine is free software: you can redistribute it and/or modify
 it under the terms of the GNU Lesser General Public License as published by
@@ -19,19 +19,19 @@ along with KBEngine.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 
-#include "telnet_server.hpp"
-#include "telnet_handler.hpp"
-#include "network/bundle.hpp"
-#include "network/endpoint.hpp"
+#include "telnet_server.h"
+#include "telnet_handler.h"
+#include "network/bundle.h"
+#include "network/endpoint.h"
 
 #ifndef CODE_INLINE
-#include "telnet_server.ipp"
+#include "telnet_server.inl"
 #endif
 
 namespace KBEngine { 
 
 //-------------------------------------------------------------------------------------
-TelnetServer::TelnetServer(Mercury::EventDispatcher* pDispatcher, Mercury::NetworkInterface* networkInterface):
+TelnetServer::TelnetServer(Network::EventDispatcher* pDispatcher, Network::NetworkInterface* networkInterface):
 handlers_(),
 listener_(),
 pDispatcher_(pDispatcher),
@@ -101,15 +101,20 @@ bool TelnetServer::start(std::string passwd, std::string deflayer, u_int16_t por
 		return false;
 	}
 
-	if(!pDispatcher_->registerFileDescriptor(listener_, this))
+	if(!pDispatcher_->registerReadFileDescriptor(listener_, this))
 	{
-		ERROR_MSG(fmt::format("TelnetServer::start:: registerFileDescriptor is failed! addr={}\n", 
+		ERROR_MSG(fmt::format("TelnetServer::start:: registerReadFileDescriptor is failed! addr={}\n", 
 			listener_.c_str()));
 
 		return false;
 	}
 
 	INFO_MSG(fmt::format("TelnetServer server is running on port {}\n", port));
+
+#if KBE_PLATFORM == PLATFORM_WIN32
+	printf("[INFO]: %s", fmt::format("TelnetServer server is running on port {}\n", port).c_str());
+#endif
+
 	return true;
 }
 
@@ -120,16 +125,15 @@ void TelnetServer::onTelnetHandlerClosed(int fd, TelnetHandler* pTelnetHandler)
 		pTelnetHandler->pEndPoint()->c_str()));
 
 	KBE_ASSERT(fd == (*pTelnetHandler->pEndPoint()));
-	pDispatcher_->deregisterFileDescriptor(fd);
+	pDispatcher_->deregisterReadFileDescriptor(fd);
 	handlers_.erase(fd);
 }
 
 //-------------------------------------------------------------------------------------
 bool TelnetServer::stop()
 {
-	pDispatcher_->deregisterFileDescriptor(listener_);
+	pDispatcher_->deregisterReadFileDescriptor(listener_);
 	listener_.close();
-	listener_.detach();
 	return true;
 }
 
@@ -143,13 +147,11 @@ void TelnetServer::closeHandler(int fd, TelnetHandler* pTelnetHandler)
 		return;
 	}
 
-	pDispatcher_->deregisterFileDescriptor(fd);
+	pDispatcher_->deregisterReadFileDescriptor(fd);
 	handlers_.erase(iter);
 
 #ifdef unix
 	::close(fd);
-#elif defined(PLAYSTATION3)
-	::socketclose(fd);
 #else
 	::closesocket(fd);
 #endif
@@ -164,7 +166,7 @@ int	TelnetServer::handleInputNotification(int fd)
 
 	while(tickcount ++ < 1024)
 	{
-		Mercury::EndPoint* pNewEndPoint = listener_.accept();
+		Network::EndPoint* pNewEndPoint = listener_.accept();
 		if(pNewEndPoint == NULL){
 
 			if(tickcount == 1)
@@ -180,9 +182,9 @@ int	TelnetServer::handleInputNotification(int fd)
 			TelnetHandler* pTelnetHandler = new TelnetHandler(pNewEndPoint, this, pNetworkInterface_, passwd_.size() > 0 ? 
 				TelnetHandler::TELNET_STATE_PASSWD : (TelnetHandler::TELNET_STATE)this->deflayer());
 
-			if(!pDispatcher_->registerFileDescriptor((*pNewEndPoint), pTelnetHandler))
+			if(!pDispatcher_->registerReadFileDescriptor((*pNewEndPoint), pTelnetHandler))
 			{
-				ERROR_MSG(fmt::format("TelnetServer::start:: registerFileDescriptor(pTelnetHandler) is failed! addr={}\n", 
+				ERROR_MSG(fmt::format("TelnetServer::start:: registerReadFileDescriptor(pTelnetHandler) is failed! addr={}\n", 
 					pNewEndPoint->c_str()));
 				
 				delete pTelnetHandler;
@@ -205,7 +207,7 @@ int	TelnetServer::handleInputNotification(int fd)
 				s = pTelnetHandler->getWelcome();
 			}
 
-			pNewEndPoint->send(s.c_str(), s.size());
+			pNewEndPoint->send(s.c_str(), (int)s.size());
 		}
 	}
 

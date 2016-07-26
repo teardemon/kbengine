@@ -2,7 +2,7 @@
 This source file is part of KBEngine
 For the latest info, see http://www.kbengine.org/
 
-Copyright (c) 2008-2012 KBEngine.
+Copyright (c) 2008-2016 KBEngine.
 
 KBEngine is free software: you can redistribute it and/or modify
 it under the terms of the GNU Lesser General Public License as published by
@@ -19,9 +19,9 @@ along with KBEngine.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 
-#include "install_py_dlls.hpp"
-#include "cstdkbe/cstdkbe.hpp"
-#include "scriptobject.hpp"
+#include "install_py_dlls.h"
+#include "common/common.h"
+#include "scriptobject.h"
 
 namespace KBEngine{ 
 namespace script{

@@ -2,7 +2,7 @@
 This source file is part of KBEngine
 For the latest info, see http://www.kbengine.org/
 
-Copyright (c) 2008-2012 KBEngine.
+Copyright (c) 2008-2016 KBEngine.
 
 KBEngine is free software: you can redistribute it and/or modify
 it under the terms of the GNU Lesser General Public License as published by
@@ -20,41 +20,45 @@ along with KBEngine.  If not, see <http://www.gnu.org/licenses/>.
 
 
 #include "jwsmtp.h"
-#include "loginapp.hpp"
-#include "http_cb_handler.hpp"
-#include "loginapp_interface.hpp"
-#include "network/common.hpp"
-#include "network/tcp_packet.hpp"
-#include "network/udp_packet.hpp"
-#include "network/message_handler.hpp"
-#include "thread/threadpool.hpp"
-#include "cstdkbe/kbeversion.hpp"
-#include "server/componentbridge.hpp"
-#include "server/components.hpp"
-#include "server/sendmail_threadtasks.hpp"
-#include "client_lib/client_interface.hpp"
-#include "network/encryption_filter.hpp"
+#include "loginapp.h"
+#include "profile.h"	
+#include "http_cb_handler.h"
+#include "loginapp_interface.h"
+#include "network/common.h"
+#include "network/tcp_packet.h"
+#include "network/udp_packet.h"
+#include "network/message_handler.h"
+#include "thread/threadpool.h"
+#include "common/kbeversion.h"
+#include "server/components.h"
+#include "server/telnet_server.h"
+#include "server/sendmail_threadtasks.h"
+#include "client_lib/client_interface.h"
+#include "network/encryption_filter.h"
 
-#include "baseapp/baseapp_interface.hpp"
-#include "baseappmgr/baseappmgr_interface.hpp"
-#include "dbmgr/dbmgr_interface.hpp"
+#include "baseapp/baseapp_interface.h"
+#include "baseappmgr/baseappmgr_interface.h"
+#include "dbmgr/dbmgr_interface.h"
+
+
 namespace KBEngine{
 	
 ServerConfig g_serverConfig;
 KBE_SINGLETON_INIT(Loginapp);
 
 //-------------------------------------------------------------------------------------
-Loginapp::Loginapp(Mercury::EventDispatcher& dispatcher, 
-			 Mercury::NetworkInterface& ninterface, 
+Loginapp::Loginapp(Network::EventDispatcher& dispatcher, 
+			 Network::NetworkInterface& ninterface, 
 			 COMPONENT_TYPE componentType,
 			 COMPONENT_ID componentID):
-	ServerApp(dispatcher, ninterface, componentType, componentID),
-	loopCheckTimerHandle_(),
+	PythonApp(dispatcher, ninterface, componentType, componentID),
+	mainProcessTimer_(),
 	pendingCreateMgr_(ninterface),
 	pendingLoginMgr_(ninterface),
 	digest_(),
 	pHttpCBHandler(NULL),
-	initProgress_(0.f)
+	initProgress_(0.f),
+	pTelnetServer_(NULL)
 {
 }
 
@@ -67,48 +71,58 @@ Loginapp::~Loginapp()
 //-------------------------------------------------------------------------------------	
 void Loginapp::onShutdownBegin()
 {
-	ServerApp::onShutdownBegin();
+	PythonApp::onShutdownBegin();
+	
+	// 通知脚本
+	SCOPED_PROFILE(SCRIPTCALL_PROFILE);
+	SCRIPT_OBJECT_CALL_ARGS0(getEntryScript().get(), const_cast<char*>("onLoginAppShutDown"));
+}
+
+//-------------------------------------------------------------------------------------	
+void Loginapp::onShutdownEnd()
+{
+	PythonApp::onShutdownEnd();
 }
 
 //-------------------------------------------------------------------------------------
 bool Loginapp::run()
 {
-	return ServerApp::run();
+	return PythonApp::run();
 }
 
 //-------------------------------------------------------------------------------------
 void Loginapp::handleTimeout(TimerHandle handle, void * arg)
 {
+	PythonApp::handleTimeout(handle, arg);
+
 	switch (reinterpret_cast<uintptr>(arg))
 	{
-		case TIMEOUT_CHECK_STATUS:
-			this->handleCheckStatusTick();
-			return;
+		case TIMEOUT_TICK:
+			this->handleMainTick();
+			break;
 		default:
 			break;
 	}
-
-	ServerApp::handleTimeout(handle, arg);
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::handleCheckStatusTick()
+void Loginapp::handleMainTick()
 {
 	threadPool_.onMainThreadTick();
-	networkInterface().processAllChannelPackets(&LoginappInterface::messageHandlers);
+	networkInterface().processChannels(&LoginappInterface::messageHandlers);
 	pendingLoginMgr_.process();
 	pendingCreateMgr_.process();
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onChannelDeregister(Mercury::Channel * pChannel)
+void Loginapp::onChannelDeregister(Network::Channel * pChannel)
 {
 	// 如果是外部通道则处理
 	if(!pChannel->isInternal())
 	{
 		const std::string& extra = pChannel->extra();
 
-		// 通知billing从队列中清除他的请求， 避免拥塞
+		// 通知dbmgr从队列中清除他的请求， 避免拥塞
 		if(extra.size() > 0)
 		{
 			Components::COMPONENTS& cts = Components::getSingleton().getComponents(DBMGR_TYPE);
@@ -122,15 +136,15 @@ void Loginapp::onChannelDeregister(Mercury::Channel * pChannel)
 			}
 			else
 			{
-				Mercury::Bundle bundle;
-				bundle.newMessage(DbmgrInterface::eraseClientReq);
-				bundle << extra;
-				bundle.send(this->networkInterface(), dbmgrinfos->pChannel);
+				Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+				(*pBundle).newMessage(DbmgrInterface::eraseClientReq);
+				(*pBundle) << extra;
+				dbmgrinfos->pChannel->send(pBundle);
 			}
 		}
 	}
 
-	ServerApp::onChannelDeregister(pChannel);
+	PythonApp::onChannelDeregister(pChannel);
 }
 
 //-------------------------------------------------------------------------------------
@@ -142,28 +156,65 @@ bool Loginapp::initializeBegin()
 //-------------------------------------------------------------------------------------
 bool Loginapp::inInitialize()
 {
-	return true;
+	return PythonApp::inInitialize();
 }
 
 //-------------------------------------------------------------------------------------
 bool Loginapp::initializeEnd()
 {
-	// 添加一个timer， 每秒检查一些状态
-	loopCheckTimerHandle_ = this->mainDispatcher().addTimer(1000000 / 50, this,
-							reinterpret_cast<void *>(TIMEOUT_CHECK_STATUS));
+	PythonApp::initializeEnd();
 
-	return true;
+	// 添加一个timer， 每秒检查一些状态
+	mainProcessTimer_ = this->dispatcher().addTimer(1000000 / 50, this,
+							reinterpret_cast<void *>(TIMEOUT_TICK));
+
+	SCOPED_PROFILE(SCRIPTCALL_PROFILE);
+
+	// 所有脚本都加载完毕
+	PyObject* pyResult = PyObject_CallMethod(getEntryScript().get(), 
+										const_cast<char*>("onLoginAppReady"), 
+										const_cast<char*>(""));
+
+	if(pyResult != NULL)
+		Py_DECREF(pyResult);
+	else
+		SCRIPT_ERROR_CHECK();
+	
+	pTelnetServer_ = new TelnetServer(&this->dispatcher(), &this->networkInterface());
+	pTelnetServer_->pScript(&this->getScript());
+
+	bool ret = pTelnetServer_->start(g_kbeSrvConfig.getLoginApp().telnet_passwd,
+		g_kbeSrvConfig.getLoginApp().telnet_deflayer,
+		g_kbeSrvConfig.getLoginApp().telnet_port);
+
+	Components::getSingleton().extraData4(pTelnetServer_->port());
+	return ret;
+}
+
+//-------------------------------------------------------------------------------------		
+void Loginapp::onInstallPyModules()
+{
+	PyObject * module = getScript().getModule();
+
+	for (int i = 0; i < SERVER_ERR_MAX; i++)
+	{
+		if(PyModule_AddIntConstant(module, SERVER_ERR_STR[i], i))
+		{
+			ERROR_MSG( fmt::format("Loginapp::onInstallPyModules: Unable to set KBEngine.{}.\n", SERVER_ERR_STR[i]));
+		}
+	}
 }
 
 //-------------------------------------------------------------------------------------
 void Loginapp::finalise()
 {
-	loopCheckTimerHandle_.cancel();
-	ServerApp::finalise();
+	mainProcessTimer_.cancel();
+	PythonApp::finalise();
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onDbmgrInitCompleted(Mercury::Channel* pChannel, int32 startGlobalOrder, int32 startGroupOrder, const std::string& digest)
+void Loginapp::onDbmgrInitCompleted(Network::Channel* pChannel, COMPONENT_ORDER startGlobalOrder, 
+	COMPONENT_ORDER startGroupOrder, const std::string& digest)
 {
 	if(pChannel->isExternal())
 		return;
@@ -179,18 +230,21 @@ void Loginapp::onDbmgrInitCompleted(Mercury::Channel* pChannel, int32 startGloba
 		pHttpCBHandler = new HTTPCBHandler();
 }
 
-
 //-------------------------------------------------------------------------------------
-void Loginapp::onClientActiveTick(Mercury::Channel* pChannel)
+void Loginapp::onClientActiveTick(Network::Channel* pChannel)
 {
 	if(!pChannel->isExternal())
 		return;
 
 	onAppActiveTick(pChannel, CLIENT_TYPE, 0);
+
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+	pBundle->newMessage(ClientInterface::onAppActiveTickCB);
+	pChannel->send(pBundle);
 }
 
 //-------------------------------------------------------------------------------------
-bool Loginapp::_createAccount(Mercury::Channel* pChannel, std::string& accountName, 
+bool Loginapp::_createAccount(Network::Channel* pChannel, std::string& accountName, 
 								 std::string& password, std::string& datas, ACCOUNT_TYPE type)
 {
 	AUTO_SCOPED_PROFILE("createAccount");
@@ -202,12 +256,12 @@ bool Loginapp::_createAccount(Mercury::Channel* pChannel, std::string& accountNa
 		WARNING_MSG(fmt::format("Loginapp::_createAccount({}): not available!\n", accountName));
 
 		std::string retdatas = "";
-		Mercury::Bundle bundle;
-		bundle.newMessage(ClientInterface::onCreateAccountResult);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
 		SERVER_ERROR_CODE retcode = SERVER_ERR_ACCOUNT_REGISTER_NOT_AVAILABLE;
-		bundle << retcode;
-		bundle.appendBlob(retdatas);
-		bundle.send(this->networkInterface(), pChannel);
+		(*pBundle) << retcode;
+		(*pBundle).appendBlob(retdatas);
+		pChannel->send(pBundle);
 		return false;
 	}
 
@@ -239,16 +293,16 @@ bool Loginapp::_createAccount(Mercury::Channel* pChannel, std::string& accountNa
 	}
 	
 	std::string retdatas = "";
-	if(shuttingdown_)
+	if(shuttingdown_ != SHUTDOWN_STATE_STOP)
 	{
 		WARNING_MSG(fmt::format("Loginapp::_createAccount: shutting down, create {} failed!\n", accountName));
 
-		Mercury::Bundle bundle;
-		bundle.newMessage(ClientInterface::onCreateAccountResult);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
 		SERVER_ERROR_CODE retcode = SERVER_ERR_IN_SHUTTINGDOWN;
-		bundle << retcode;
-		bundle.appendBlob(retdatas);
-		bundle.send(this->networkInterface(), pChannel);
+		(*pBundle) << retcode;
+		(*pBundle).appendBlob(retdatas);
+		pChannel->send(pBundle);
 		return false;
 	}
 
@@ -258,15 +312,96 @@ bool Loginapp::_createAccount(Mercury::Channel* pChannel, std::string& accountNa
 		WARNING_MSG(fmt::format("Loginapp::_createAccount: pendingCreateMgr has {}, request create failed!\n", 
 			accountName));
 
-		Mercury::Bundle bundle;
-		bundle.newMessage(ClientInterface::onCreateAccountResult);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
 		SERVER_ERROR_CODE retcode = SERVER_ERR_BUSY;
-		bundle << retcode;
-		bundle.appendBlob(retdatas);
-		bundle.send(this->networkInterface(), pChannel);
+		(*pBundle) << retcode;
+		(*pBundle).appendBlob(retdatas);
+		pChannel->send(pBundle);
 		return false;
 	}
 	
+	{
+		// 把请求交由脚本处理
+		SERVER_ERROR_CODE retcode = SERVER_SUCCESS;
+		SCOPED_PROFILE(SCRIPTCALL_PROFILE);
+
+		PyObject* pyResult = PyObject_CallMethod(getEntryScript().get(), 
+											const_cast<char*>("onRequestCreateAccount"), 
+											const_cast<char*>("ssy#"), 
+											accountName.c_str(),
+											password.c_str(),
+											datas.c_str(), datas.length());
+
+		if(pyResult != NULL)
+		{
+			if(PySequence_Check(pyResult) && PySequence_Size(pyResult) == 4)
+			{
+				char* sname;
+				char* spassword;
+			    char *extraDatas;
+			    Py_ssize_t extraDatas_size = 0;
+				
+				if(PyArg_ParseTuple(pyResult, "H|s|s|y#",  &retcode, &sname, &spassword, &extraDatas, &extraDatas_size) == -1)
+				{
+					ERROR_MSG(fmt::format("Loginapp::_createAccount: {}.onReuqestLogin, Return value error! accountName={}\n", 
+						g_kbeSrvConfig.getLoginApp().entryScriptFile, accountName));
+
+					retcode = SERVER_ERR_OP_FAILED;
+				}
+				else
+				{
+					accountName = sname;
+					password = spassword;
+
+					if (extraDatas && extraDatas_size > 0)
+						datas.assign(extraDatas, extraDatas_size);
+					else
+						SCRIPT_ERROR_CHECK();
+				}
+			}
+			else
+			{
+				ERROR_MSG(fmt::format("Loginapp::_createAccount: {}.onReuqestLogin, Return value error, must be errorcode or tuple! accountName={}\n", 
+					g_kbeSrvConfig.getLoginApp().entryScriptFile, accountName));
+
+				retcode = SERVER_ERR_OP_FAILED;
+			}
+			
+			Py_DECREF(pyResult);
+		}
+		else
+		{
+			SCRIPT_ERROR_CHECK();
+			retcode = SERVER_ERR_OP_FAILED;
+		}
+			
+		if(retcode != SERVER_SUCCESS)
+		{
+			Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+			(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
+			(*pBundle) << retcode;
+			(*pBundle).appendBlob(retdatas);
+			pChannel->send(pBundle);
+			return false;
+		}
+		else
+		{
+			if(accountName.size() == 0)
+			{
+				ERROR_MSG(fmt::format("Loginapp::_createAccount: accountName is empty!\n"));
+
+				retcode = SERVER_ERR_NAME;
+				Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+				(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
+				(*pBundle) << retcode;
+				(*pBundle).appendBlob(retdatas);
+				pChannel->send(pBundle);
+				return false;
+			}
+		}
+	}
+
 	if(type == ACCOUNT_TYPE_SMART)
 	{
 		if (email_isvalid(accountName.c_str()))
@@ -280,12 +415,12 @@ bool Loginapp::_createAccount(Mercury::Channel* pChannel, std::string& accountNa
 				ERROR_MSG(fmt::format("Loginapp::_createAccount: invalid accountName({})\n",
 					accountName));
 
-				Mercury::Bundle bundle;
-				bundle.newMessage(ClientInterface::onCreateAccountResult);
+				Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+				(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
 				SERVER_ERROR_CODE retcode = SERVER_ERR_NAME;
-				bundle << retcode;
-				bundle.appendBlob(retdatas);
-				bundle.send(this->networkInterface(), pChannel);
+				(*pBundle) << retcode;
+				(*pBundle).appendBlob(retdatas);
+				pChannel->send(pBundle);
 				return false;
 			}
 
@@ -299,12 +434,12 @@ bool Loginapp::_createAccount(Mercury::Channel* pChannel, std::string& accountNa
 			ERROR_MSG(fmt::format("Loginapp::_createAccount: invalid accountName({})\n",
 				accountName));
 
-			Mercury::Bundle bundle;
-			bundle.newMessage(ClientInterface::onCreateAccountResult);
+			Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+			(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
 			SERVER_ERROR_CODE retcode = SERVER_ERR_NAME;
-			bundle << retcode;
-			bundle.appendBlob(retdatas);
-			bundle.send(this->networkInterface(), pChannel);
+			(*pBundle) << retcode;
+			(*pBundle).appendBlob(retdatas);
+			pChannel->send(pBundle);
 			return false;
 		}
 	}
@@ -318,12 +453,12 @@ bool Loginapp::_createAccount(Mercury::Channel* pChannel, std::string& accountNa
 		WARNING_MSG(fmt::format("Loginapp::_createAccount: invalid mail={}\n", 
 			accountName));
 
-		Mercury::Bundle bundle;
-		bundle.newMessage(ClientInterface::onCreateAccountResult);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
 		SERVER_ERROR_CODE retcode = SERVER_ERR_NAME_MAIL;
-		bundle << retcode;
-		bundle.appendBlob(retdatas);
-		bundle.send(this->networkInterface(), pChannel);
+		(*pBundle) << retcode;
+		(*pBundle).appendBlob(retdatas);
+		pChannel->send(pBundle);
 		return false;
     }
 
@@ -348,28 +483,28 @@ bool Loginapp::_createAccount(Mercury::Channel* pChannel, std::string& accountNa
 		ERROR_MSG(fmt::format("Loginapp::_createAccount: create({}), not found dbmgr!\n", 
 			accountName));
 
-		Mercury::Bundle bundle;
-		bundle.newMessage(ClientInterface::onCreateAccountResult);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
 		SERVER_ERROR_CODE retcode = SERVER_ERR_SRV_NO_READY;
-		bundle << retcode;
-		bundle.appendBlob(retdatas);
-		bundle.send(this->networkInterface(), pChannel);
+		(*pBundle) << retcode;
+		(*pBundle).appendBlob(retdatas);
+		pChannel->send(pBundle);
 		return false;
 	}
 
 	pChannel->extra(accountName);
 
-	Mercury::Bundle bundle;
-	bundle.newMessage(DbmgrInterface::reqCreateAccount);
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+	(*pBundle).newMessage(DbmgrInterface::reqCreateAccount);
 	uint8 uatype = uint8(type);
-	bundle << accountName << password << uatype;
-	bundle.appendBlob(datas);
-	bundle.send(this->networkInterface(), dbmgrinfos->pChannel);
+	(*pBundle) << accountName << password << uatype;
+	(*pBundle).appendBlob(datas);
+	dbmgrinfos->pChannel->send(pBundle);
 	return true;
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::reqCreateAccount(Mercury::Channel* pChannel, MemoryStream& s)
+void Loginapp::reqCreateAccount(Network::Channel* pChannel, MemoryStream& s)
 {
 	std::string accountName, password, datas;
 
@@ -381,7 +516,7 @@ void Loginapp::reqCreateAccount(Mercury::Channel* pChannel, MemoryStream& s)
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::reqCreateMailAccount(Mercury::Channel* pChannel, MemoryStream& s)
+void Loginapp::reqCreateMailAccount(Network::Channel* pChannel, MemoryStream& s)
 {
 	std::string accountName, password, datas, retdatas = "";
 
@@ -396,7 +531,7 @@ void Loginapp::reqCreateMailAccount(Mercury::Channel* pChannel, MemoryStream& s)
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onReqCreateAccountResult(Mercury::Channel* pChannel, MemoryStream& s)
+void Loginapp::onReqCreateAccountResult(Network::Channel* pChannel, MemoryStream& s)
 {
 	SERVER_ERROR_CODE failedcode;
 	std::string accountName;
@@ -406,6 +541,24 @@ void Loginapp::onReqCreateAccountResult(Mercury::Channel* pChannel, MemoryStream
 	s >> failedcode >> accountName >> password;
 	s.readBlob(retdatas);
 
+	// 把请求交由脚本处理
+	SCOPED_PROFILE(SCRIPTCALL_PROFILE);
+	PyObject* pyResult = PyObject_CallMethod(getEntryScript().get(), 
+										const_cast<char*>("onCreateAccountCallbackFromDB"), 
+										const_cast<char*>("sHy#"), 
+										accountName.c_str(),
+										failedcode,
+										retdatas.c_str(), retdatas.length());
+
+	if(pyResult != NULL)
+	{
+		Py_DECREF(pyResult);
+	}
+	else
+	{
+		SCRIPT_ERROR_CHECK();
+	}
+
 	DEBUG_MSG(fmt::format("Loginapp::onReqCreateAccountResult: accountName={}, failedcode={}.\n",
 		accountName.c_str(), failedcode));
 
@@ -413,24 +566,23 @@ void Loginapp::onReqCreateAccountResult(Mercury::Channel* pChannel, MemoryStream
 	if(ptinfos == NULL)
 		return;
 
-	Mercury::Channel* pClientChannel = this->networkInterface().findChannel(ptinfos->addr);
+	Network::Channel* pClientChannel = this->networkInterface().findChannel(ptinfos->addr);
 	if(pClientChannel == NULL)
 		return;
 
 	pClientChannel->extra("");
 
-	Mercury::Bundle bundle;
-	bundle.newMessage(ClientInterface::onCreateAccountResult);
-	bundle << failedcode;
-	bundle.appendBlob(retdatas);
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+	(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
+	(*pBundle) << failedcode;
+	(*pBundle).appendBlob(retdatas);
 
-	bundle.send(this->networkInterface(), pClientChannel);
-
+	pClientChannel->send(pBundle);
 	SAFE_RELEASE(ptinfos);
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onReqCreateMailAccountResult(Mercury::Channel* pChannel, MemoryStream& s)
+void Loginapp::onReqCreateMailAccountResult(Network::Channel* pChannel, MemoryStream& s)
 {
 	SERVER_ERROR_CODE failedcode;
 	std::string accountName;
@@ -458,7 +610,7 @@ void Loginapp::onReqCreateMailAccountResult(Mercury::Channel* pChannel, MemorySt
 		else
 		{
 			Components::COMPONENTS::iterator iter = loginapps.begin();
-			for(; iter != loginapps.end(); iter++)
+			for(; iter != loginapps.end(); ++iter)
 			{
 				if((*iter).groupOrderid == 1)
 				{
@@ -479,25 +631,25 @@ void Loginapp::onReqCreateMailAccountResult(Mercury::Channel* pChannel, MemorySt
 	if(ptinfos == NULL)
 		return;
 
-	Mercury::Channel* pClientChannel = this->networkInterface().findChannel(ptinfos->addr);
+	Network::Channel* pClientChannel = this->networkInterface().findChannel(ptinfos->addr);
 	if(pClientChannel == NULL)
 		return;
 
 	pClientChannel->extra("");
 	retdatas = "";
 
-	Mercury::Bundle bundle;
-	bundle.newMessage(ClientInterface::onCreateAccountResult);
-	bundle << failedcode;
-	bundle.appendBlob(retdatas);
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+	(*pBundle).newMessage(ClientInterface::onCreateAccountResult);
+	(*pBundle) << failedcode;
+	(*pBundle).appendBlob(retdatas);
 
-	bundle.send(this->networkInterface(), pClientChannel);
+	pClientChannel->send(pBundle);
 
 	SAFE_RELEASE(ptinfos);
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onAccountActivated(Mercury::Channel* pChannel, std::string& code, bool success)
+void Loginapp::onAccountActivated(Network::Channel* pChannel, std::string& code, bool success)
 {
 	DEBUG_MSG(fmt::format("Loginapp::onAccountActivated: code={}, success={}\n", code, success));
 	if(!pHttpCBHandler)
@@ -510,7 +662,7 @@ void Loginapp::onAccountActivated(Mercury::Channel* pChannel, std::string& code,
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onAccountBindedEmail(Mercury::Channel* pChannel, std::string& code, bool success)
+void Loginapp::onAccountBindedEmail(Network::Channel* pChannel, std::string& code, bool success)
 {
 	DEBUG_MSG(fmt::format("Loginapp::onAccountBindedEmail: code={}, success={}\n", code, success));
 	if(!pHttpCBHandler)
@@ -523,7 +675,7 @@ void Loginapp::onAccountBindedEmail(Mercury::Channel* pChannel, std::string& cod
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onAccountResetPassword(Mercury::Channel* pChannel, std::string& code, bool success)
+void Loginapp::onAccountResetPassword(Network::Channel* pChannel, std::string& code, bool success)
 {
 	DEBUG_MSG(fmt::format("Loginapp::onAccountResetPassword: code={}, success={}\n", code, success));
 	if(!pHttpCBHandler)
@@ -536,7 +688,7 @@ void Loginapp::onAccountResetPassword(Mercury::Channel* pChannel, std::string& c
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::reqAccountResetPassword(Mercury::Channel* pChannel, std::string& accountName)
+void Loginapp::reqAccountResetPassword(Network::Channel* pChannel, std::string& accountName)
 {
 	AUTO_SCOPED_PROFILE("reqAccountResetPassword");
 
@@ -555,32 +707,32 @@ void Loginapp::reqAccountResetPassword(Mercury::Channel* pChannel, std::string& 
 		ERROR_MSG(fmt::format("Loginapp::_createAccount: create({}), not found dbmgr!\n", 
 			accountName));
 
-		Mercury::Bundle bundle;
-		bundle.newMessage(ClientInterface::onReqAccountResetPasswordCB);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(ClientInterface::onReqAccountResetPasswordCB);
 		SERVER_ERROR_CODE retcode = SERVER_ERR_SRV_NO_READY;
-		bundle << retcode;
-		bundle.send(this->networkInterface(), pChannel);
+		(*pBundle) << retcode;
+		pChannel->send(pBundle);
 		return;
 	}
 
 	{
-		Mercury::Bundle bundle;
-		bundle.newMessage(DbmgrInterface::accountReqResetPassword);
-		bundle << accountName;
-		bundle.send(this->networkInterface(), dbmgrinfos->pChannel);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(DbmgrInterface::accountReqResetPassword);
+		(*pBundle) << accountName;
+		dbmgrinfos->pChannel->send(pBundle);
 	}
 
 	{
-		Mercury::Bundle bundle;
-		bundle.newMessage(ClientInterface::onReqAccountResetPasswordCB);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(ClientInterface::onReqAccountResetPasswordCB);
 		SERVER_ERROR_CODE retcode = SERVER_SUCCESS;
-		bundle << retcode;
-		bundle.send(this->networkInterface(), pChannel);
+		(*pBundle) << retcode;
+		pChannel->send(pBundle);
 	}
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onReqAccountResetPasswordCB(Mercury::Channel* pChannel, std::string& accountName, std::string& email,
+void Loginapp::onReqAccountResetPasswordCB(Network::Channel* pChannel, std::string& accountName, std::string& email,
 	SERVER_ERROR_CODE failedcode, std::string& code)
 {
 	INFO_MSG(fmt::format("Loginapp::onReqAccountResetPasswordCB: {}, email={}, failedcode={}!\n", 
@@ -601,7 +753,7 @@ void Loginapp::onReqAccountResetPasswordCB(Mercury::Channel* pChannel, std::stri
 		else
 		{
 			Components::COMPONENTS::iterator iter = loginapps.begin();
-			for(; iter != loginapps.end(); iter++)
+			for(; iter != loginapps.end(); ++iter)
 			{
 				if((*iter).groupOrderid == 1)
 				{
@@ -620,7 +772,7 @@ void Loginapp::onReqAccountResetPasswordCB(Mercury::Channel* pChannel, std::stri
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::login(Mercury::Channel* pChannel, MemoryStream& s)
+void Loginapp::login(Network::Channel* pChannel, MemoryStream& s)
 {
 	AUTO_SCOPED_PROFILE("login");
 
@@ -648,6 +800,7 @@ void Loginapp::login(Mercury::Channel* pChannel, MemoryStream& s)
 	{
 		INFO_MSG("Loginapp::login: loginName is NULL.\n");
 		_loginFailed(pChannel, loginName, SERVER_ERR_NAME, datas, true);
+		s.done();
 		return;
 	}
 
@@ -656,7 +809,8 @@ void Loginapp::login(Mercury::Channel* pChannel, MemoryStream& s)
 		INFO_MSG(fmt::format("Loginapp::login: loginName is too long, size={}, limit={}.\n",
 			loginName.size(), ACCOUNT_NAME_MAX_LENGTH));
 		
-		_loginFailed(pChannel, loginName, SERVER_ERR_NAME, datas);
+		_loginFailed(pChannel, loginName, SERVER_ERR_NAME, datas, true);
+		s.done();
 		return;
 	}
 
@@ -665,7 +819,8 @@ void Loginapp::login(Mercury::Channel* pChannel, MemoryStream& s)
 		INFO_MSG(fmt::format("Loginapp::login: password is too long, size={}, limit={}.\n",
 			password.size(), ACCOUNT_PASSWD_MAX_LENGTH));
 		
-		_loginFailed(pChannel, loginName, SERVER_ERR_PASSWORD, datas);
+		_loginFailed(pChannel, loginName, SERVER_ERR_PASSWORD, datas, true);
+		s.done();
 		return;
 	}
 	
@@ -674,35 +829,153 @@ void Loginapp::login(Mercury::Channel* pChannel, MemoryStream& s)
 		INFO_MSG(fmt::format("Loginapp::login: bindatas is too long, size={}, limit={}.\n",
 			datas.size(), ACCOUNT_DATA_MAX_LENGTH));
 		
-		_loginFailed(pChannel, loginName, SERVER_ERR_OP_FAILED, datas);
+		_loginFailed(pChannel, loginName, SERVER_ERR_OP_FAILED, datas, true);
+		s.done();
 		return;
 	}
 
-	if(!g_kbeSrvConfig.getDBMgr().allowEmptyDigest && (ctype != CLIENT_TYPE_BROWSER && ctype != CLIENT_TYPE_MINI))
+	// 首先必须baseappmgr和dbmgr都已经准备完毕了。
+	Components::ComponentInfos* baseappmgrinfos = Components::getSingleton().getBaseappmgr();
+	if(baseappmgrinfos == NULL || baseappmgrinfos->pChannel == NULL || baseappmgrinfos->cid == 0)
+	{
+		datas = "";
+		_loginFailed(pChannel, loginName, SERVER_ERR_SRV_NO_READY, datas, true);
+		s.done();
+		return;
+	}
+
+	Components::ComponentInfos* dbmgrinfos = Components::getSingleton().getDbmgr();
+	if(dbmgrinfos == NULL || dbmgrinfos->pChannel == NULL || dbmgrinfos->cid == 0)
+	{
+		datas = "";
+		_loginFailed(pChannel, loginName, SERVER_ERR_SRV_NO_READY, datas, true);
+		s.done();
+		return;
+	}
+
+	if(!g_kbeSrvConfig.getDBMgr().allowEmptyDigest)
 	{
 		std::string clientDigest;
 
-		if(s.opsize() > 0)
+		if(s.length() > 0)
 			s >> clientDigest;
 
-		if(clientDigest != digest_)
+		if(clientDigest.size() > 0)
 		{
-			INFO_MSG(fmt::format("Loginapp::login: loginName({}), digest not match. curr({}) != dbmgr({})\n",
-				loginName, clientDigest, digest_));
+			if(clientDigest != digest_)
+			{
+				INFO_MSG(fmt::format("Loginapp::login: loginName({}), digest not match. curr({}) != dbmgr({})\n",
+					loginName, clientDigest, digest_));
 
-			datas = "";
-			_loginFailed(pChannel, loginName, SERVER_ERR_ENTITYDEFS_NOT_MATCH, datas, true);
-			return;
+				datas = "";
+				_loginFailed(pChannel, loginName, SERVER_ERR_ENTITYDEFS_NOT_MATCH, datas, true);
+				return;
+			}
+		}
+		else
+		{
+			//WARNING_MSG(fmt::format("Loginapp::login: loginName={} no check entitydefs!\n", loginName));
 		}
 	}
 
-	s.opfini();
+	s.done();
+
+	if(shuttingdown_ != SHUTDOWN_STATE_STOP)
+	{
+		INFO_MSG(fmt::format("Loginapp::login: shutting down, {} login failed!\n", loginName));
+
+		datas = "";
+		_loginFailed(pChannel, loginName, SERVER_ERR_IN_SHUTTINGDOWN, datas, true);
+		return;
+	}
+
+	if(initProgress_ < 1.f)
+	{
+		datas = fmt::format("initProgress: {}", initProgress_);
+		_loginFailed(pChannel, loginName, SERVER_ERR_SRV_STARTING, datas, true);
+		return;
+	}
+	
+	// 把请求交由脚本处理
+	SCOPED_PROFILE(SCRIPTCALL_PROFILE);
+	PyObject* pyResult = PyObject_CallMethod(getEntryScript().get(), 
+										const_cast<char*>("onReuqestLogin"), 
+										const_cast<char*>("ssby#"), 
+										loginName.c_str(),
+										password.c_str(),
+										tctype,
+										datas.c_str(), datas.length());
+
+	if(pyResult != NULL)
+	{
+		bool login_check = true;
+		if(PySequence_Check(pyResult) && PySequence_Size(pyResult) == 5)
+		{
+			char* sname;
+			char* spassword;
+		    char *extraDatas;
+		    Py_ssize_t extraDatas_size = 0;
+			SERVER_ERROR_CODE error;
+			
+			if(PyArg_ParseTuple(pyResult, "H|s|s|b|y#",  &error, &sname, &spassword, &tctype, &extraDatas, &extraDatas_size) == -1)
+			{
+				ERROR_MSG(fmt::format("Loginapp::login: {}.onReuqestLogin, Return value error! loginName={}\n", 
+					g_kbeSrvConfig.getLoginApp().entryScriptFile, loginName));
+
+				login_check = false;
+				_loginFailed(pChannel, loginName, SERVER_ERR_OP_FAILED, datas, true);
+			}
+			
+			if(login_check)
+			{
+				loginName = sname;
+				password = spassword;
+
+				if (extraDatas && extraDatas_size > 0)
+					datas.assign(extraDatas, extraDatas_size);
+				else
+					SCRIPT_ERROR_CHECK();
+			}
+			
+			if(error != SERVER_SUCCESS)
+			{
+				login_check = false;
+				_loginFailed(pChannel, loginName, error, datas, true);
+			}
+			
+			if(loginName.size() == 0)
+			{
+				INFO_MSG("Loginapp::login: loginName is NULL.\n");
+				_loginFailed(pChannel, loginName, SERVER_ERR_NAME, datas, true);
+				s.done();
+				return;
+			}
+		}
+		else
+		{
+			ERROR_MSG(fmt::format("Loginapp::login: {}.onReuqestLogin, Return value error, must be errorcode or tuple! loginName={}\n", 
+				g_kbeSrvConfig.getLoginApp().entryScriptFile, loginName));
+
+			login_check = false;
+			_loginFailed(pChannel, loginName, SERVER_ERR_OP_FAILED, datas, true);
+		}
+		
+		Py_DECREF(pyResult);
+		
+		if(!login_check)
+			return;
+	}
+	else
+	{
+		SCRIPT_ERROR_CHECK();
+		_loginFailed(pChannel, loginName, SERVER_ERR_OP_FAILED, datas, true);
+	}
 
 	PendingLoginMgr::PLInfos* ptinfos = pendingLoginMgr_.find(loginName);
 	if(ptinfos != NULL)
 	{
 		datas = "";
-		_loginFailed(pChannel, loginName, SERVER_ERR_BUSY, datas);
+		_loginFailed(pChannel, loginName, SERVER_ERR_BUSY, datas, true);
 		return;
 	}
 
@@ -717,105 +990,80 @@ void Loginapp::login(Mercury::Channel* pChannel, MemoryStream& s)
 	if(ctype < UNKNOWN_CLIENT_COMPONENT_TYPE || ctype >= CLIENT_TYPE_END)
 		ctype = UNKNOWN_CLIENT_COMPONENT_TYPE;
 
-	if(shuttingdown_)
-	{
-		INFO_MSG(fmt::format("Loginapp::login: shutting down, {} login failed!\n", loginName));
-
-		datas = "";
-		_loginFailed(pChannel, loginName, SERVER_ERR_IN_SHUTTINGDOWN, datas);
-		return;
-	}
-
-	if(initProgress_ < 1.f)
-	{
-		datas = fmt::format("initProgress: {}", initProgress_);
-		_loginFailed(pChannel, loginName, SERVER_ERR_SRV_STARTING, datas);
-		return;
-	}
-
 	INFO_MSG(fmt::format("Loginapp::login: new client[{0}], loginName={1}, datas={2}.\n",
 		COMPONENT_CLIENT_NAME[ctype], loginName, datas));
-
-	// 首先必须baseappmgr和dbmgr都已经准备完毕了。
-	Components::COMPONENTS& cts = Components::getSingleton().getComponents(BASEAPPMGR_TYPE);
-	Components::ComponentInfos* baseappmgrinfos = NULL;
-	if(cts.size() > 0)
-		baseappmgrinfos = &(*cts.begin());
-
-	if(baseappmgrinfos == NULL || baseappmgrinfos->pChannel == NULL || baseappmgrinfos->cid == 0)
-	{
-		datas = "";
-		_loginFailed(pChannel, loginName, SERVER_ERR_SRV_NO_READY, datas);
-		return;
-	}
-
-	Components::COMPONENTS& cts1 = Components::getSingleton().getComponents(DBMGR_TYPE);
-	Components::ComponentInfos* dbmgrinfos = NULL;
-
-	if(cts1.size() > 0)
-		dbmgrinfos = &(*cts1.begin());
-
-	if(dbmgrinfos == NULL || dbmgrinfos->pChannel == NULL || dbmgrinfos->cid == 0)
-	{
-		datas = "";
-		_loginFailed(pChannel, loginName, SERVER_ERR_SRV_NO_READY, datas);
-		return;
-	}
 
 	pChannel->extra(loginName);
 
 	// 向dbmgr查询用户合法性
-	Mercury::Bundle bundle;
-	bundle.newMessage(DbmgrInterface::onAccountLogin);
-	bundle << loginName << password;
-	bundle.appendBlob(datas);
-	bundle.send(this->networkInterface(), dbmgrinfos->pChannel);
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+	(*pBundle).newMessage(DbmgrInterface::onAccountLogin);
+	(*pBundle) << loginName << password;
+	(*pBundle).appendBlob(datas);
+	dbmgrinfos->pChannel->send(pBundle);
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::_loginFailed(Mercury::Channel* pChannel, std::string& loginName, SERVER_ERROR_CODE failedcode, std::string& datas, bool force)
+void Loginapp::_loginFailed(Network::Channel* pChannel, std::string& loginName, SERVER_ERROR_CODE failedcode, std::string& datas, bool force)
 {
 	INFO_MSG(fmt::format("Loginapp::loginFailed: loginName={0} login is failed. failedcode={1}, datas={2}.\n",
 		loginName, SERVER_ERR_STR[failedcode], datas));
 	
-	PendingLoginMgr::PLInfos* infos = pendingLoginMgr_.remove(loginName);
-	if(infos == NULL && !force)
-		return;
+	PendingLoginMgr::PLInfos* infos = NULL;
 
-	Mercury::Bundle bundle;
-	bundle.newMessage(ClientInterface::onLoginFailed);
-	bundle << failedcode;
-	bundle.appendBlob(datas);
+	if(!force)
+	{
+		infos = pendingLoginMgr_.remove(loginName);
+		if(infos == NULL)
+			return;
+	}
+
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+	(*pBundle).newMessage(ClientInterface::onLoginFailed);
+	(*pBundle) << failedcode;
+	(*pBundle).appendBlob(datas);
 
 	if(pChannel)
 	{
-		bundle.send(this->networkInterface(), pChannel);
+		pChannel->send(pBundle);
 	}
 	else 
 	{
-		Mercury::Channel* pClientChannel = this->networkInterface().findChannel(infos->addr);
-		if(pClientChannel)
-			bundle.send(this->networkInterface(), pClientChannel);
+		if(infos)
+		{
+			Network::Channel* pClientChannel = this->networkInterface().findChannel(infos->addr);
+			if(pClientChannel)
+				pClientChannel->send(pBundle);
+			else
+				Network::Bundle::reclaimPoolObject(pBundle);
+		}
+		else
+		{
+			ERROR_MSG(fmt::format("Loginapp::_loginFailed: infos({}) is NULL!\n", 
+				loginName));
+
+			Network::Bundle::reclaimPoolObject(pBundle);
+		}
 	}
 
 	SAFE_RELEASE(infos);
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onLoginAccountQueryResultFromDbmgr(Mercury::Channel* pChannel, MemoryStream& s)
+void Loginapp::onLoginAccountQueryResultFromDbmgr(Network::Channel* pChannel, MemoryStream& s)
 {
 	if(pChannel->isExternal())
 		return;
 
 	std::string loginName, accountName, password, datas;
-	bool success = true;
+	SERVER_ERROR_CODE retcode = SERVER_SUCCESS;
 	COMPONENT_ID componentID;
 	ENTITY_ID entityID;
 	DBID dbid;
 	uint32 flags;
 	uint64 deadline;
 
-	s >> success;
+	s >> retcode;
 
 	// 登录名既登录时客户端输入的名称， 账号名则是dbmgr查询得到的名称
 	// 这个机制用于一个账号多名称系统或者多个第三方账号系统登入服务器
@@ -862,15 +1110,34 @@ void Loginapp::onLoginAccountQueryResultFromDbmgr(Mercury::Channel* pChannel, Me
 		return;
 	}
 
+	// 把请求交由脚本处理
+	SCOPED_PROFILE(SCRIPTCALL_PROFILE);
+	PyObject* pyResult = PyObject_CallMethod(getEntryScript().get(), 
+										const_cast<char*>("onLoginCallbackFromDB"), 
+										const_cast<char*>("ssHy#"), 
+										loginName.c_str(),
+										accountName.c_str(),
+										retcode,
+										datas.c_str(), datas.length());
+
+	if(pyResult != NULL)
+	{
+		Py_DECREF(pyResult);
+	}
+	else
+	{
+		SCRIPT_ERROR_CHECK();
+	}
+	
 	infos->datas = datas;
 
-	Mercury::Channel* pClientChannel = this->networkInterface().findChannel(infos->addr);
+	Network::Channel* pClientChannel = this->networkInterface().findChannel(infos->addr);
 	if(pClientChannel)
 		pClientChannel->extra("");
 
-	if(!success && entityID == 0 && componentID == 0)
+	if(retcode != SERVER_SUCCESS && entityID == 0 && componentID == 0)
 	{
-		_loginFailed(NULL, loginName, SERVER_ERR_NAME_PASSWORD, datas);
+		_loginFailed(NULL, loginName, retcode, datas);
 		return;
 	}
 
@@ -889,37 +1156,39 @@ void Loginapp::onLoginAccountQueryResultFromDbmgr(Mercury::Channel* pChannel, Me
 	// 如果大于0则说明当前账号仍然存活于某个baseapp上
 	if(componentID > 0)
 	{
-		Mercury::Bundle bundle;
-		bundle.newMessage(BaseappmgrInterface::registerPendingAccountToBaseappAddr);
-		bundle << componentID << loginName << accountName << password << entityID << dbid << flags << deadline << infos->ctype;
-		bundle.send(this->networkInterface(), baseappmgrinfos->pChannel);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(BaseappmgrInterface::registerPendingAccountToBaseappAddr);
+		(*pBundle) << componentID << loginName << accountName << password << entityID << dbid << flags << deadline << infos->ctype;
+		(*pBundle).appendBlob(infos->datas);
+		baseappmgrinfos->pChannel->send(pBundle);
 		return;
 	}
 	else
 	{
 		// 注册到baseapp并且获取baseapp的地址
-		Mercury::Bundle bundle;
-		bundle.newMessage(BaseappmgrInterface::registerPendingAccountToBaseapp);
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+		(*pBundle).newMessage(BaseappmgrInterface::registerPendingAccountToBaseapp);
 
-		bundle << loginName;
-		bundle << accountName;
-		bundle << password;
-		bundle << dbid;
-		bundle << flags;
-		bundle << deadline;
-		bundle << infos->ctype;
-		bundle.send(this->networkInterface(), baseappmgrinfos->pChannel);
+		(*pBundle) << loginName;
+		(*pBundle) << accountName;
+		(*pBundle) << password;
+		(*pBundle) << dbid;
+		(*pBundle) << flags;
+		(*pBundle) << deadline;
+		(*pBundle) << infos->ctype;
+		(*pBundle).appendBlob(infos->datas);
+		baseappmgrinfos->pChannel->send(pBundle);
 	}
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onLoginAccountQueryBaseappAddrFromBaseappmgr(Mercury::Channel* pChannel, std::string& loginName, 
-															std::string& accountName, uint32 addr, uint16 port)
+void Loginapp::onLoginAccountQueryBaseappAddrFromBaseappmgr(Network::Channel* pChannel, std::string& loginName, 
+															std::string& accountName, std::string& addr, uint16 port)
 {
 	if(pChannel->isExternal())
 		return;
 	
-	if(addr == 0)
+	if(addr.size() == 0)
 	{
 		ERROR_MSG(fmt::format("Loginapp::onLoginAccountQueryBaseappAddrFromBaseappmgr:accountName={}, not found baseapp.\n", 
 			loginName));
@@ -928,7 +1197,7 @@ void Loginapp::onLoginAccountQueryBaseappAddrFromBaseappmgr(Mercury::Channel* pC
 		_loginFailed(NULL, loginName, SERVER_ERR_SRV_NO_READY, datas);
 	}
 
-	Mercury::Address address(addr, port);
+	Network::Address address(addr, ntohs(port));
 
 	DEBUG_MSG(fmt::format("Loginapp::onLoginAccountQueryBaseappAddrFromBaseappmgr:accountName={0}, addr={1}.\n", 
 		loginName, address.c_str()));
@@ -939,7 +1208,7 @@ void Loginapp::onLoginAccountQueryBaseappAddrFromBaseappmgr(Mercury::Channel* pC
 		return;
 	
 	infos->lastProcessTime = timestamp();
-	Mercury::Channel* pClientChannel = this->networkInterface().findChannel(infos->addr);
+	Network::Channel* pClientChannel = this->networkInterface().findChannel(infos->addr);
 
 	if(pClientChannel == NULL)
 	{
@@ -947,42 +1216,40 @@ void Loginapp::onLoginAccountQueryBaseappAddrFromBaseappmgr(Mercury::Channel* pC
 		return;
 	}
 
-	Mercury::Bundle bundle;
-	bundle.newMessage(ClientInterface::onLoginSuccessfully);
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
+	(*pBundle).newMessage(ClientInterface::onLoginSuccessfully);
 	uint16 fport = ntohs(port);
-	bundle << accountName;
-	bundle << inet_ntoa((struct in_addr&)addr);
-	bundle << fport;
-	bundle.appendBlob(infos->datas);
-	bundle.send(this->networkInterface(), pClientChannel);
+	(*pBundle) << accountName;
+	(*pBundle) << addr;
+	(*pBundle) << fport;
+	(*pBundle).appendBlob(infos->datas);
+	pClientChannel->send(pBundle);
 
 	SAFE_RELEASE(infos);
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onHello(Mercury::Channel* pChannel, 
+void Loginapp::onHello(Network::Channel* pChannel, 
 						const std::string& verInfo, 
 						const std::string& scriptVerInfo, 
 						const std::string& encryptedKey)
 {
-	Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
 	
 	pBundle->newMessage(ClientInterface::onHelloCB);
 	(*pBundle) << KBEVersion::versionString();
 	(*pBundle) << KBEVersion::scriptVersionString();
-	(*pBundle) << Mercury::MessageHandlers::getDigestStr();
+	(*pBundle) << Network::MessageHandlers::getDigestStr();
 	(*pBundle) << digest_;
 	(*pBundle) << g_componentType;
-	(*pBundle).send(networkInterface(), pChannel);
+	pChannel->send(pBundle);
 
-	Mercury::Bundle::ObjPool().reclaimObject(pBundle);
-
-	if(Mercury::g_channelExternalEncryptType > 0)
+	if(Network::g_channelExternalEncryptType > 0)
 	{
 		if(encryptedKey.size() > 3)
 		{
 			// 替换为一个加密的过滤器
-			pChannel->pFilter(Mercury::createEncryptionFilter(Mercury::g_channelExternalEncryptType, encryptedKey));
+			pChannel->pFilter(Network::createEncryptionFilter(Network::g_channelExternalEncryptType, encryptedKey));
 		}
 		else
 		{
@@ -993,45 +1260,41 @@ void Loginapp::onHello(Mercury::Channel* pChannel,
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onVersionNotMatch(Mercury::Channel* pChannel)
+void Loginapp::onVersionNotMatch(Network::Channel* pChannel)
 {
-	Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
 	
 	pBundle->newMessage(ClientInterface::onVersionNotMatch);
 	(*pBundle) << KBEVersion::versionString();
-	(*pBundle).send(networkInterface(), pChannel);
-
-	Mercury::Bundle::ObjPool().reclaimObject(pBundle);
+	pChannel->send(pBundle);
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onScriptVersionNotMatch(Mercury::Channel* pChannel)
+void Loginapp::onScriptVersionNotMatch(Network::Channel* pChannel)
 {
-	Mercury::Bundle* pBundle = Mercury::Bundle::ObjPool().createObject();
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject();
 	
 	pBundle->newMessage(ClientInterface::onScriptVersionNotMatch);
 	(*pBundle) << KBEVersion::scriptVersionString();
-	(*pBundle).send(networkInterface(), pChannel);
-
-	Mercury::Bundle::ObjPool().reclaimObject(pBundle);
+	pChannel->send(pBundle);
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::importClientMessages(Mercury::Channel* pChannel)
+void Loginapp::importClientMessages(Network::Channel* pChannel)
 {
-	static Mercury::Bundle bundle;
+	static Network::Bundle bundle;
 	
-	if(bundle.packets().size() == 0)
+	if(bundle.empty())
 	{
-		std::map< Mercury::MessageID, Mercury::ExposedMessageInfo > clientMessages;
+		std::map< Network::MessageID, Network::ExposedMessageInfo > clientMessages;
 		{
-			const Mercury::MessageHandlers::MessageHandlerMap& msgHandlers = ClientInterface::messageHandlers.msgHandlers();
-			Mercury::MessageHandlers::MessageHandlerMap::const_iterator iter = msgHandlers.begin();
-			for(; iter != msgHandlers.end(); iter++)
+			const Network::MessageHandlers::MessageHandlerMap& msgHandlers = ClientInterface::messageHandlers.msgHandlers();
+			Network::MessageHandlers::MessageHandlerMap::const_iterator iter = msgHandlers.begin();
+			for(; iter != msgHandlers.end(); ++iter)
 			{
-				Mercury::MessageHandler* pMessageHandler = iter->second;
+				Network::MessageHandler* pMessageHandler = iter->second;
 
-				Mercury::ExposedMessageInfo& info = clientMessages[iter->first];
+				Network::ExposedMessageInfo& info = clientMessages[iter->first];
 				info.id = iter->first;
 				info.name = pMessageHandler->name;
 				info.msgLen = pMessageHandler->msgLen;
@@ -1039,31 +1302,31 @@ void Loginapp::importClientMessages(Mercury::Channel* pChannel)
 
 				KBEngine::strutil::kbe_replace(info.name, "::", "_");
 				std::vector<std::string>::iterator iter1 = pMessageHandler->pArgs->strArgsTypes.begin();
-				for(; iter1 !=  pMessageHandler->pArgs->strArgsTypes.end(); iter1++)
+				for(; iter1 !=  pMessageHandler->pArgs->strArgsTypes.end(); ++iter1)
 				{
 					info.argsTypes.push_back((uint8)datatype2id((*iter1)));
 				}
 			}
 		}
 
-		std::map< Mercury::MessageID, Mercury::ExposedMessageInfo > messages;
+		std::map< Network::MessageID, Network::ExposedMessageInfo > messages;
 		{
-			const Mercury::MessageHandlers::MessageHandlerMap& msgHandlers = LoginappInterface::messageHandlers.msgHandlers();
-			Mercury::MessageHandlers::MessageHandlerMap::const_iterator iter = msgHandlers.begin();
-			for(; iter != msgHandlers.end(); iter++)
+			const Network::MessageHandlers::MessageHandlerMap& msgHandlers = LoginappInterface::messageHandlers.msgHandlers();
+			Network::MessageHandlers::MessageHandlerMap::const_iterator iter = msgHandlers.begin();
+			for(; iter != msgHandlers.end(); ++iter)
 			{
-				Mercury::MessageHandler* pMessageHandler = iter->second;
+				Network::MessageHandler* pMessageHandler = iter->second;
 				if(!iter->second->exposed)
 					continue;
 
-				Mercury::ExposedMessageInfo& info = messages[iter->first];
+				Network::ExposedMessageInfo& info = messages[iter->first];
 				info.id = iter->first;
 				info.name = pMessageHandler->name;
 				info.msgLen = pMessageHandler->msgLen;
 				
 				KBEngine::strutil::kbe_replace(info.name, "::", "_");
 				std::vector<std::string>::iterator iter1 = pMessageHandler->pArgs->strArgsTypes.begin();
-				for(; iter1 !=  pMessageHandler->pArgs->strArgsTypes.end(); iter1++)
+				for(; iter1 !=  pMessageHandler->pArgs->strArgsTypes.end(); ++iter1)
 				{
 					info.argsTypes.push_back((uint8)datatype2id((*iter1)));
 				}
@@ -1072,61 +1335,66 @@ void Loginapp::importClientMessages(Mercury::Channel* pChannel)
 	
 		bundle.newMessage(ClientInterface::onImportClientMessages);
 		
-		uint16 size = messages.size() + clientMessages.size();
+		uint16 size = (uint16)(messages.size() + clientMessages.size());
 		bundle << size;
 
-		std::map< Mercury::MessageID, Mercury::ExposedMessageInfo >::iterator iter = clientMessages.begin();
-		for(; iter != clientMessages.end(); iter++)
+		std::map< Network::MessageID, Network::ExposedMessageInfo >::iterator iter = clientMessages.begin();
+		for(; iter != clientMessages.end(); ++iter)
 		{
-			uint8 argsize = iter->second.argsTypes.size();
+			uint8 argsize = (uint8)iter->second.argsTypes.size();
 			bundle << iter->second.id << iter->second.msgLen << iter->second.name << iter->second.argsType << argsize;
 
 			std::vector<uint8>::iterator argiter = iter->second.argsTypes.begin();
-			for(; argiter != iter->second.argsTypes.end(); argiter++)
+			for(; argiter != iter->second.argsTypes.end(); ++argiter)
 			{
 				bundle << (*argiter);
 			}
 		}
 
 		iter = messages.begin();
-		for(; iter != messages.end(); iter++)
+		for(; iter != messages.end(); ++iter)
 		{
-			uint8 argsize = iter->second.argsTypes.size();
+			uint8 argsize = (uint8)iter->second.argsTypes.size();
 			bundle << iter->second.id << iter->second.msgLen << iter->second.name << iter->second.argsType << argsize;
 
 			std::vector<uint8>::iterator argiter = iter->second.argsTypes.begin();
-			for(; argiter != iter->second.argsTypes.end(); argiter++)
+			for(; argiter != iter->second.argsTypes.end(); ++argiter)
 			{
 				bundle << (*argiter);
 			}
 		}
 	}
 
-	bundle.resend(networkInterface(), pChannel);
+	pChannel->send(new Network::Bundle(bundle));
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::importServerErrorsDescr(Mercury::Channel* pChannel)
+void Loginapp::importServerErrorsDescr(Network::Channel* pChannel)
 {
-	static Mercury::Bundle bundle;
+	static Network::Bundle bundle;
 	
-	if(bundle.packets().size() == 0)
+	if(bundle.empty())
 	{
 		std::map<uint16, std::pair< std::string, std::string> > errsDescrs;
 
 		TiXmlNode *rootNode = NULL;
-		XmlPlus* xml = new XmlPlus(Resmgr::getSingleton().matchRes("server/server_errors.xml").c_str());
+		SmartPointer<XML> xml(new XML(Resmgr::getSingleton().matchRes("server/server_errors.xml").c_str()));
 
 		if(!xml->isGood())
 		{
 			ERROR_MSG(fmt::format("ServerConfig::loadConfig: load {} is failed!\n",
 				"server/server_errors.xml"));
 
-			SAFE_RELEASE(xml);
 			return;
 		}
 
 		rootNode = xml->getRootNode();
+		if(rootNode == NULL)
+		{
+			// root节点下没有子节点了
+			return;
+		}
+
 		XML_FOR_BEGIN(rootNode)
 		{
 			TiXmlNode* node = xml->enterNode(rootNode->FirstChild(), "id");
@@ -1135,26 +1403,24 @@ void Loginapp::importServerErrorsDescr(Mercury::Channel* pChannel)
 		}
 		XML_FOR_END(rootNode);
 
-		SAFE_RELEASE(xml);
-
 		bundle.newMessage(ClientInterface::onImportServerErrorsDescr);
 		std::map<uint16, std::pair< std::string, std::string> >::iterator iter = errsDescrs.begin();
-		uint16 size = errsDescrs.size();
+		uint16 size = (uint16)errsDescrs.size();
 
 		bundle << size;
-		for(; iter != errsDescrs.end(); iter++)
+		for(; iter != errsDescrs.end(); ++iter)
 		{
 			bundle << iter->first;
-			bundle.appendBlob(iter->second.first.data(), iter->second.first.size());
-			bundle.appendBlob(iter->second.second.data(), iter->second.second.size());
+			bundle.appendBlob(iter->second.first.data(), (ArraySize)iter->second.first.size());
+			bundle.appendBlob(iter->second.second.data(), (ArraySize)iter->second.second.size());
 		}
 	}
 
-	bundle.resend(networkInterface(), pChannel);
+	pChannel->send(new Network::Bundle(bundle));
 }
 
 //-------------------------------------------------------------------------------------
-void Loginapp::onBaseappInitProgress(Mercury::Channel* pChannel, float progress)
+void Loginapp::onBaseappInitProgress(Network::Channel* pChannel, float progress)
 {
 	if(progress > 1.f)
 	{

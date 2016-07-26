@@ -20,10 +20,25 @@ LIBDIR=$(KBE_ROOT)/kbe/src/lib/bin
 
 all install clean full:
 	test -d $(LIBDIR) || mkdir $(LIBDIR)
+	cd dependencies/openssl && $(MAKE) $@
+	cd dependencies/hiredis && $(MAKE) $@
+	cd dependencies/zip && $(MAKE) $@
+	cd dependencies/g3dlite && $(MAKE) $@
+	cd dependencies/tinyxml && $(MAKE) $@
+	cd dependencies/sigar/linux && $(MAKE) $@
+	cd dependencies/tmxparser && $(MAKE) $@
+	cd dependencies/jwsmtp/jwsmtp/jwsmtp && $(MAKE) $@
+	cd dependencies/jemalloc && $(MAKE) $@
+	cd dependencies/apr && $(MAKE) $@
+	cd dependencies/expat && $(MAKE) $@
+	cd dependencies/apr-util && $(MAKE) $@
+	cd dependencies/log4cxx && $(MAKE) $@
+	cd python && $(MAKE) $@
 	cd client_lib && $(MAKE) $@
-	cd cstdkbe && $(MAKE) $@
+	cd common && $(MAKE) $@
+	cd db_redis && $(MAKE) $@
 	cd db_mysql && $(MAKE) $@
-	cd dbmgr_lib && $(MAKE) $@
+	cd db_interface && $(MAKE) $@
 	cd entitydef && $(MAKE) $@
 	cd math && $(MAKE) $@
 	cd resmgr && $(MAKE) $@
@@ -33,14 +48,5 @@ all install clean full:
 	cd network && $(MAKE) $@
 	cd helper && $(MAKE) $@
 	cd thread && $(MAKE) $@
-	cd xmlplus && $(MAKE) $@
-	cd dependencies/zip && $(MAKE) $@
-	cd dependencies/g3dlite && $(MAKE) $@
-	cd dependencies/tinyxml && $(MAKE) $@
-	cd dependencies/sigar/linux && $(MAKE) $@
-	cd dependencies/jsoncpp/src/lib_json && $(MAKE) $@
-	cd dependencies/tmxparser && $(MAKE) $@
-	cd dependencies/jwsmtp/jwsmtp/jwsmtp && $(MAKE) $@
+	cd xml && $(MAKE) $@
 
-version kbeversion kbe_version:
-	@$(MAKE) -s -C server $@

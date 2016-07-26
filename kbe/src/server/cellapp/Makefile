@@ -18,6 +18,7 @@ SRCS =						\
 	entity_coordinate_node			\
 	ghost_manager				\
 	history_event				\
+	initprogress_handler			\
 	loadnavmesh_threadtasks			\
 	main					\
 	space					\
@@ -30,10 +31,12 @@ SRCS =						\
 	proximity_controller			\
 	coordinate_node				\
 	coordinate_system			\
+	rotator_handler				\
 	range_trigger				\
 	range_trigger_node			\
 	real_entity_method			\
 	trap_trigger				\
+	turn_controller				\
 	updatable				\
 	updatables				\
 	watch_obj_pools				\

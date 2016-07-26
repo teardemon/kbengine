@@ -2,7 +2,7 @@
 This source file is part of KBEngine
 For the latest info, see http://www.kbengine.org/
 
-Copyright (c) 2008-2012 KBEngine.
+Copyright (c) 2008-2016 KBEngine.
 
 KBEngine is free software: you can redistribute it and/or modify
 it under the terms of the GNU Lesser General Public License as published by
@@ -18,21 +18,21 @@ You should have received a copy of the GNU Lesser General Public License
 along with KBEngine.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-
-#include "fixedarray.hpp"
-#include "datatypes.hpp"
+#include "fixedarray.h"
+#include "datatypes.h"
+#include "pyscript/py_gc.h"
 
 namespace KBEngine{ 
 
 SCRIPT_METHOD_DECLARE_BEGIN(FixedArray)
-SCRIPT_METHOD_DECLARE("__reduce_ex__",		reduce_ex__,	METH_VARARGS, 0)
-SCRIPT_METHOD_DECLARE("append",				append,			METH_VARARGS, 0)
-SCRIPT_METHOD_DECLARE("count",				count,			METH_VARARGS, 0)
-SCRIPT_METHOD_DECLARE("extend",				extend,			METH_VARARGS, 0)
-SCRIPT_METHOD_DECLARE("index",				index,			METH_VARARGS, 0)
-SCRIPT_METHOD_DECLARE("insert",				insert,			METH_VARARGS, 0)
-SCRIPT_METHOD_DECLARE("pop",				pop,			METH_VARARGS, 0)
-SCRIPT_METHOD_DECLARE("remove",				remove,			METH_VARARGS, 0)
+SCRIPT_METHOD_DECLARE("__reduce_ex__",				reduce_ex__,			METH_VARARGS, 0)
+SCRIPT_METHOD_DECLARE("append",						append,					METH_VARARGS, 0)
+SCRIPT_METHOD_DECLARE("count",						count,					METH_VARARGS, 0)
+SCRIPT_METHOD_DECLARE("extend",						extend,					METH_VARARGS, 0)
+SCRIPT_METHOD_DECLARE("index",						index,					METH_VARARGS, 0)
+SCRIPT_METHOD_DECLARE("insert",						insert,					METH_VARARGS, 0)
+SCRIPT_METHOD_DECLARE("pop",						pop,					METH_VARARGS, 0)
+SCRIPT_METHOD_DECLARE("remove",						remove,					METH_VARARGS, 0)
 SCRIPT_METHOD_DECLARE_END()
 
 
@@ -51,6 +51,8 @@ Sequence(getScriptType(), false)
 	_dataType->incRef();
 	initialize(strInitData);
 
+	script::PyGC::incTracing("FixedArray");
+
 //	DEBUG_MSG(fmt::format("FixedArray::FixedArray(): {:p}\n", this));
 }
 
@@ -61,6 +63,8 @@ Sequence(getScriptType(), false)
 	_dataType = static_cast<FixedArrayType*>(dataType);
 	_dataType->incRef();
 	initialize(pyInitData);
+
+	script::PyGC::incTracing("FixedArray");
 
 //	DEBUG_MSG(fmt::format("FixedArray::FixedArray(): {:p}\n", this));
 }
@@ -73,6 +77,8 @@ Sequence(getScriptType(), false)
 	_dataType->incRef();
 	initialize("");
 
+	script::PyGC::incTracing("FixedArray");
+
 //	DEBUG_MSG(fmt::format("FixedArray::FixedArray(): {:p}\n", this));
 }
 
@@ -80,6 +86,8 @@ Sequence(getScriptType(), false)
 FixedArray::~FixedArray()
 {
 	_dataType->decRef();
+
+	script::PyGC::decTracing("FixedArray");
 
 //	DEBUG_MSG(fmt::format("FixedArray::~FixedArray(): {:p}\n", this));
 }
@@ -101,7 +109,7 @@ void FixedArray::initialize(PyObject* pyObjInitData)
 	}
 
 	 Py_ssize_t size = PySequence_Size(pyObjInitData);
-	 for(Py_ssize_t i=0; i<size; i++)
+	 for(Py_ssize_t i=0; i<size; ++i)
 	 {
 		 PyObject* pyobj = PySequence_GetItem(pyObjInitData, i);
 		 values_.push_back(_dataType->createNewItemFromObj(pyobj));
@@ -123,7 +131,7 @@ PyObject* FixedArray::__py_reduce_ex__(PyObject* self, PyObject* protocol)
 	if(len > 0)
 	{
 		std::vector<PyObject*>& values = arr->getValues();
-		for(int i=0; i<len; i++)
+		for(int i=0; i<len; ++i)
 		{
 			Py_INCREF(values[i]);
 			PyList_SET_ITEM(pyList, i, values[i]);
@@ -148,7 +156,7 @@ PyObject* FixedArray::__unpickle__(PyObject* self, PyObject* args)
 	Py_ssize_t size = PyTuple_Size(args);
 	if(size != 2)
 	{
-		ERROR_MSG("FixedArray::__unpickle__: args is error! size != 2");
+		ERROR_MSG("FixedArray::__unpickle__: args is wrong! (size != 2)");
 		S_Return;
 	}
 	
@@ -157,7 +165,7 @@ PyObject* FixedArray::__unpickle__(PyObject* self, PyObject* args)
 	PyObject* pyList = PyTuple_GET_ITEM(args, 1);
 	if(pyList == NULL)
 	{
-		ERROR_MSG("FixedArray::__unpickle__: args is error!");
+		ERROR_MSG("FixedArray::__unpickle__: args is wrong!");
 		S_Return;
 	}
 	
@@ -243,10 +251,10 @@ PyObject* FixedArray::__py_insert(PyObject* self, PyObject* args, PyObject* kwar
 	PyObject* pyTuple = PyTuple_New(1);
 	PyTuple_SET_ITEM(&*pyTuple, 0, pyobj);
 
-	const int argsize = PyTuple_Size(args);
+	const int argsize = (int)PyTuple_Size(args);
 	if(argsize > 2)
 	{
-		PyErr_SetString(PyExc_ValueError, "FixedArray::insert: args is error!");
+		PyErr_SetString(PyExc_ValueError, "FixedArray::insert: args is wrong!");
 		return NULL;
 	}
 	
@@ -267,7 +275,7 @@ PyObject* FixedArray::__py_pop(PyObject* self, PyObject* args, PyObject* kwargs)
 
 	PyObject* pyItem = PyTuple_GetItem(args, 0);
 	int index = PyLong_AsLong(pyItem);
-	if (index < 0) index += values.size();
+	if (index < 0) index += (int)values.size();
 	if (uint32(index) >= values.size())
 	{
 		PyErr_SetString(PyExc_IndexError, "FixedArray.pop: index out of range");
@@ -311,7 +319,7 @@ PyObject* FixedArray::tp_repr()
 	std::vector<PyObject*>& values = getValues();
 	PyObject* pyList = PyList_New(values.size());
 	
-	for(size_t i=0; i<values.size(); i++)
+	for(size_t i=0; i<values.size(); ++i)
 	{
 		Py_INCREF(values[i]);
 		PyList_SET_ITEM(pyList, i, values[i]);
